@@ -89,6 +89,7 @@ pack.addFormula({
     }),
   ],
   resultType: coda.ValueType.Object,
+  cacheTtlSecs: 0,
   schema: coda.makeObjectSchema({
     properties: {
       url: { type: coda.ValueType.String, codaType: coda.ValueHintType.Url },
@@ -160,7 +161,6 @@ pack.addFormula({
   },
 });
 
-// Formula to get available slide layouts from a presentation
 // Formula to get available slide layouts from a presentation
 pack.addFormula({
   name: "GetSlideLayouts",
@@ -407,7 +407,7 @@ pack.addFormula({
 pack.addFormula({
   name: "AddSlide",
   isAction: true,
-  description: "Adds a slide to an existing Google Slides presentation",
+  description: "Adds a slide to a presentation and returns the new slide ID",
   parameters: [
     coda.makeParameter({
       type: coda.ParameterType.String,
@@ -449,101 +449,210 @@ pack.addFormula({
       }
     }),
     coda.makeParameter({
+      type: coda.ParameterType.Number,
+      name: "maxAttempts",
+      description: "Maximum number of attempts to verify slide creation",
+      optional: true,
+      suggestedValues: [5, 10, 15]
+    })
+  ],
+  resultType: coda.ValueType.Object,
+  schema: coda.makeObjectSchema({
+    properties: {
+      slideId: { type: coda.ValueType.String },
+      slideNumber: { type: coda.ValueType.Number },
+      presentationId: { type: coda.ValueType.String },
+      layoutType: { type: coda.ValueType.String },
+      slideUrl: { type: coda.ValueType.String, codaType: coda.ValueHintType.Url }
+    },
+    displayProperty: "slideId",
+  }),
+  execute: async function ([presentationReference, layoutType = "TITLE_AND_BODY", maxAttempts = 10], context) {
+    try {
+      // Extract presentation ID
+      const presentationId = extractPresentationId(presentationReference);
+
+      // 1) Fetch presentation to verify it exists
+      const presUrl = `https://slides.googleapis.com/v1/presentations/${presentationId}`;
+      const presDataInitial = await context.fetcher.fetch({ 
+        method: "GET", 
+        url: presUrl 
+      });
+
+      // 2) Create the slide request
+      const createSlideRequest = createSlideWithLayout(layoutType, presentationId);
+
+      // 3) Send batchUpdate to create the slide
+      const batchUrl = `https://slides.googleapis.com/v1/presentations/${presentationId}:batchUpdate`;
+      const createResponse = await context.fetcher.fetch({
+        method: "POST",
+        url: batchUrl,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ requests: [createSlideRequest] }),
+      });
+
+      // 4) Capture the newly created slide ID
+      const newSlideId = createResponse.body.replies[0].createSlide.objectId;
+
+      // 5) Retry fetching the presentation until the new slide appears
+      let newPresData, newSlideNumber;
+      let attempts = 0;
+
+      while (attempts < maxAttempts) {
+        newPresData = await context.fetcher.fetch({
+          method: "GET",
+          url: presUrl,
+          cacheTtlSecs: 0, // Disable caching
+        });
+        
+        // Find the index of the new slide
+        const foundSlideIndex = newPresData.body.slides?.findIndex(s => s.objectId === newSlideId);
+        
+        if (foundSlideIndex !== undefined && foundSlideIndex >= 0) {
+          newSlideNumber = foundSlideIndex + 1;
+          break;
+        }
+
+        // Brief pause via a no-op request
+        await context.fetcher.fetch({
+          method: "GET",
+          url: `https://slides.googleapis.com/v1/presentations/${presentationId}`,
+        });
+
+        attempts++;
+      }
+
+      if (newSlideNumber === undefined) {
+        throw new coda.UserVisibleError(
+          `New slide created with ID ${newSlideId}, but slide verification failed after ${maxAttempts} attempts. The slide ID is still returned and may work with AddContent after a brief delay.`
+        );
+      }
+
+      // 6) Return slide information
+      return {
+        slideId: newSlideId,
+        slideNumber: newSlideNumber,
+        presentationId: presentationId,
+        layoutType: layoutType,
+        slideUrl: `https://docs.google.com/presentation/d/${presentationId}/edit#slide=id.${newSlideId}`
+      };
+    } catch (error) {
+      if (error.statusCode === 401) {
+        throw error; // Trigger token refresh
+      } else if (error.statusCode === 403) {
+        throw new coda.UserVisibleError("You don't have permission to modify this presentation.");
+      } else if (error.statusCode === 404) {
+        throw new coda.UserVisibleError("Presentation not found. Check the ID or URL.");
+      } else if (error instanceof coda.UserVisibleError) {
+        throw error; // Pass through user visible errors
+      } else {
+        throw new coda.UserVisibleError(`Failed to add slide: ${error.body?.error?.message || error.message}`);
+      }
+    }
+  },
+});
+
+// Formula to add or update content on an existing slide
+pack.addFormula({
+  name: "AddContent",
+  isAction: true,
+  description: "Adds or updates content on an existing slide",
+  parameters: [
+    coda.makeParameter({
+      type: coda.ParameterType.String,
+      name: "presentationReference",
+      description: "The ID or URL of the presentation",
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.String,
+      name: "slideId",
+      description: "ID of the slide to update",
+    }),
+    coda.makeParameter({
       type: coda.ParameterType.String,
       name: "slideContent",
       description: "JSON string containing slide content for placeholders",
-      optional: true,
-      autocomplete: async function (context, search, {presentationReference, layoutType}) {
-        if (!presentationReference || !layoutType) {
+      autocomplete: async function (context, search, {presentationReference, slideId}) {
+        if (!presentationReference || !slideId) {
           return [
             { display: "Title: 'Hello World'", value: '{"title": "Hello World"}' },
             { display: "Title and subtitle", value: '{"title": "My Presentation", "subtitle": "Created with Coda"}' },
             { display: "With image by URL", value: '{"title": "Slide with Image", "imageUrl": "https://example.com/image.jpg"}' },
-            { display: "With advanced image options", value: '{"title": "Customized Image", "image": {"url": "https://example.com/image.jpg", "elementProperties": {"size": {"height": {"magnitude": 250, "unit": "PT"}, "width": {"magnitude": 400, "unit": "PT"}}, "transform": {"scaleX": 1, "scaleY": 1, "translateX": 150, "translateY": 100, "unit": "PT"}}}}' }
           ];
         }
         
         try {
-          // Create custom JSON strings directly with proper JSON formatting
+          // Get slide layout type by fetching slide information
+          const presentationId = extractPresentationId(presentationReference);
+          const url = `https://slides.googleapis.com/v1/presentations/${presentationId}`;
+          const response = await context.fetcher.fetch({
+            method: "GET",
+            url: url,
+          });
+          
+          // Find the specific slide
+          const slide = response.body.slides?.find(s => s.objectId === slideId);
+          if (!slide) {
+            return [
+              { display: "Basic title", value: '{"title": "New Slide"}' },
+              { display: "With image", value: '{"title": "New Slide", "imageUrl": "https://example.com/image.jpg"}' },
+            ];
+          }
+          
+          // Determine layout type from slide properties
+          let layoutType = "UNKNOWN";
+          if (slide.slideProperties && slide.slideProperties.layoutObjectId) {
+            const layoutId = slide.slideProperties.layoutObjectId;
+            for (const master of response.body.masters || []) {
+              for (const layout of master.layouts || []) {
+                if (layout.objectId === layoutId && layout.layoutProperties) {
+                  layoutType = layout.layoutProperties.predefinedLayout || "CUSTOM";
+                  break;
+                }
+              }
+            }
+          }
+          
+          // Create content suggestions based on layout type
           let basicContentJson;
-          let formattedContentJson;
 
           if (layoutType === "TITLE") {
-            basicContentJson = '{"title": "My Title Slide", "subtitle": "Created automatically"}';
+            basicContentJson = '{"title": "My Title Slide", "subtitle": "Created with Coda"}';
           } else if (layoutType === "TITLE_AND_BODY") {
             basicContentJson = '{"title": "Slide Title", "body": "• First bullet point\n• Second bullet point\n• Third bullet point"}';
           } else if (layoutType === "SECTION_HEADER") {
             basicContentJson = '{"title": "Section Title", "subtitle": "Section description goes here"}';
           } else if (layoutType === "TITLE_AND_TWO_COLUMNS") {
-            basicContentJson = '{"title": "Two Column Slide", "leftbody": "• Left column point 1\n• Left column point 2", "rightbody": "• Right column point 1\n• Right column point 2"}';
-          } else if (layoutType === "TITLE_ONLY") {
-            basicContentJson = '{"title": "Title Only Slide"}';
-          } else if (layoutType === "BLANK") {
-            basicContentJson = '{"image": {"url": "https://example.com/image.jpg", "elementProperties": {"height": {"magnitude": 300, "unit": "PT"}, "width": {"magnitude": 400, "unit": "PT"}, "transform": {"scaleX": 1, "scaleY": 1, "translateX": 100, "translateY": 100, "unit": "PT"}}}}';
-          } else if (layoutType === "CAPTION") {
-            basicContentJson = '{"caption": "Caption text goes here"}';
-          } else if (layoutType === "BIG_NUMBER") {
-            basicContentJson = '{"title": "Big Number Slide", "bignumber": "42", "body": "Description of what this number represents"}';
-          } else if (layoutType === "TITLE_AND_CAPTION") {
-            basicContentJson = '{"title": "Main Title", "caption": "Supporting caption text"}';
-          } else if (layoutType === "CAPTION_ONLY") {
-            basicContentJson = '{"caption": "Stand-alone caption text"}';
-          } else if (layoutType === "MAIN_POINT") {
-            basicContentJson = '{"title": "Key Takeaway", "subtitle": "Supporting information for this main point"}';
-          } else if (layoutType === "SECTION_TITLE_AND_DESCRIPTION") {
-            basicContentJson = '{"title": "New Section", "body": "This section covers the following topics..."}';
-          } else if (layoutType === "ONE_COLUMN_TEXT") {
-            basicContentJson = '{"title": "Information", "body": "This is a single column text layout ideal for paragraphs of information rather than bullet points."}';
-          } else if (layoutType === "QUOTE") {
-            basicContentJson = '{"quotation": "\\"The best way to predict the future is to create it.\\"", "speaker": "— Peter Drucker"}';
+            basicContentJson = '{"title": "Two Column Slide", "leftBody": "• Left column point 1\n• Left column point 2", "rightBody": "• Right column point 1\n• Right column point 2"}';
           } else {
-            // For any custom layout (when layoutType is a layout ID)
-            basicContentJson = '{"title": "Custom Layout Title", "subtitle": "Custom layout subtitle", "body": "Main content area"}';
-          }
-
-          if (layoutType === "TITLE_AND_BODY" || layoutType === "SECTION_HEADER" || 
-              layoutType === "TITLE_ONLY" || layoutType === "TITLE_AND_TWO_COLUMNS") {
-            // Use the simpler imageUrl property for better readability
-            formattedContentJson = basicContentJson.replace(
-              /}$/,
-              ', "imageUrl": "https://example.com/image.jpg"}'
-            );
-          } else if (layoutType === "BLANK") {
-            // For blank slides, keep using the full image object for advanced positioning
-            formattedContentJson = '{"image": {"url": "https://example.com/image.jpg", "elementProperties": {"height": {"magnitude": 300, "unit": "PT"}, "width": {"magnitude": 400, "unit": "PT"}, "transform": {"scaleX": 1, "scaleY": 1, "translateX": 100, "translateY": 100, "unit": "PT"}}}}';
-          } else {
-            formattedContentJson = basicContentJson.replace(
-              /"title": "([^"]+)"/,
-              '"title": "$1", "title_format": {"foregroundColor": {"color": {"rgbColor": {"red": 0.2, "green": 0.4, "blue": 0.8}}}, "bold": true}'
-            );
+            basicContentJson = '{"title": "Slide Title", "subtitle": "Optional subtitle", "body": "Main content area"}';
           }
           
           return [
             { display: "Basic content", value: basicContentJson },
-            { display: (layoutType === "BLANK" ? "With image" : 
-                       (layoutType === "TITLE_AND_BODY" || layoutType === "SECTION_HEADER" || 
-                        layoutType === "TITLE_ONLY" || layoutType === "TITLE_AND_TWO_COLUMNS") ? 
-                       "With image" : "With formatted title"), 
-              value: formattedContentJson },
             { display: "With image by URL", value: basicContentJson.replace(/}$/, ', "imageUrl": "https://example.com/image.jpg"}') },
-            { display: "With advanced image positioning", 
-              value: basicContentJson.replace(/}$/, ', "image": {"url": "https://example.com/image.jpg", "elementProperties": {"size": {"height": {"magnitude": 250, "unit": "PT"}, "width": {"magnitude": 400, "unit": "PT"}}, "transform": {"scaleX": 1, "scaleY": 1, "translateX": 150, "translateY": 100, "unit": "PT"}}}}') }
+            { display: "With notes", value: basicContentJson.replace(/}$/, ', "notes": "Speaker notes for this slide"}') },
+            { display: "With formatting", value: basicContentJson.replace(/"title": "([^"]+)"/, '"title": "$1", "title_format": {"foregroundColor": {"color": {"rgbColor": {"red": 0.2, "green": 0.4, "blue": 0.8}}}, "bold": true}') },
           ];
         } catch (error) {
           return [
-            { display: "Basic title", value: '{"title": "New Slide"}' },
-            { display: "With image", value: '{"title": "New Slide", "imageUrl": "https://example.com/image.jpg"}' },
-            { display: "Image only", value: '{"imageUrl": "https://example.com/image.jpg"}' }
+            { display: "Basic title", value: '{"title": "Updated Slide"}' },
+            { display: "With image", value: '{"title": "Updated Slide", "imageUrl": "https://example.com/image.jpg"}' },
           ];
         }
       }
     }),
+    coda.makeParameter({
+      type: coda.ParameterType.Boolean,
+      name: "clearExisting",
+      description: "Whether to clear existing content before adding new content",
+      optional: true,
+    }),
   ],
-  resultType: coda.ValueType.Number,
-  cacheTtlSecs: 0,
-  execute: async function ([presentationReference, layoutType = "TITLE_AND_BODY", slideContentJson], context) {
+  resultType: coda.ValueType.Boolean,
+  execute: async function ([presentationReference, slideId, slideContentJson, clearExisting = false], context) {
     try {
-      // 1) Extract ID and parse slide content if provided
+      // 1) Extract presentation ID and parse slide content
       const presentationId = extractPresentationId(presentationReference);
       
       // Define the type for slideContent to satisfy TypeScript
@@ -567,6 +676,7 @@ pack.addFormula({
           };
         };
         imageUrl?: string; // Simple alternative to the full image object
+        notes?: string;   // Speaker notes
       }
       
       let slideContent: SlideContentType = {};
@@ -576,268 +686,165 @@ pack.addFormula({
         } catch (e) {
           throw new coda.UserVisibleError("Invalid JSON format for slide content. Please provide valid JSON.");
         }
+      } else {
+        throw new coda.UserVisibleError("Slide content is required.");
       }
 
-      // 2) Fetch presentation so we know it exists
-      const presUrl = `https://slides.googleapis.com/v1/presentations/${presentationId}`;
-      const presDataInitial = await context.fetcher.fetch({ method: "GET", url: presUrl });
-
-      // 3) Create the slide with proper layout reference
-      const createSlideRequest = createSlideWithLayout(layoutType, presentationId);
-
-      // 4) Send batchUpdate to create the slide
-      const batchUrl = `https://slides.googleapis.com/v1/presentations/${presentationId}:batchUpdate`;
-      const createResponse = await context.fetcher.fetch({
-        method: "POST",
-        url: batchUrl,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requests: [createSlideRequest] }),
-      });
-
-      // 5) Capture the newly created slide ID
-      const newSlideId = createResponse.body.replies[0].createSlide.objectId;
-
-      // 6) Retry fetching the presentation until the new slide appears
-      let newPresData, newSlide;
-      let attempts = 0;
-      const maxAttempts = 10;
-
-      while (attempts < maxAttempts) {
-        newPresData = await context.fetcher.fetch({
-          method: "GET",
-          url: presUrl,
-          cacheTtlSecs: 0, // Disable fetcher-level caching
-        });
-        newSlide = newPresData.body.slides?.find(s => s.objectId === newSlideId);
-
-        if (newSlide) {
-          break;
-        }
-
-        // Optional small delay
+      // 2) Verify slide exists
+      const slideUrl = `https://slides.googleapis.com/v1/presentations/${presentationId}/slides/${slideId}`;
+      try {
         await context.fetcher.fetch({
           method: "GET",
-          url: `https://slides.googleapis.com/v1/presentations/${presentationId}`,
+          url: slideUrl,
         });
-
-        attempts++;
+      } catch (error) {
+        if (error.statusCode === 404) {
+          throw new coda.UserVisibleError(`Slide with ID ${slideId} not found. The slide may still be processing or the ID may be incorrect.`);
+        }
+        throw error;
       }
 
-      if (!newSlide) {
-        throw new coda.UserVisibleError(
-          `New slide not ready after ${maxAttempts} attempts. Please try again.`
-        );
-      }
+      // 3) Prepare content update requests
+      const contentRequests = [];
+      
+      // 4) Get slide details to find placeholders
+      const slideResponse = await context.fetcher.fetch({
+        method: "GET",
+        url: slideUrl,
+      });
+      
+      const pageElements = slideResponse.body.pageElements || [];
 
-      // 7) If slide content is provided, create requests to fill placeholders
-      if (Object.keys(slideContent).length > 0) {
-        const contentRequests = [];
-        const pageElements = newSlide.pageElements || [];
-
-        // Handle images - either from image object or imageUrl string
-        if ((slideContent.image && slideContent.image.url) || slideContent.imageUrl) {
-          const imageUrl = slideContent.image?.url || slideContent.imageUrl;
-          if (imageUrl) {
+      // 5) If clearing existing content, add delete text requests
+      if (clearExisting) {
+        pageElements.forEach(element => {
+          if (element.shape && element.shape.text) {
             contentRequests.push({
-              createImage: {
-                url: imageUrl,
-                elementProperties: slideContent.image?.elementProperties || {
-                  pageObjectId: newSlideId,
-                  size: {
-                    height: { magnitude: 200, unit: "PT" },
-                    width: { magnitude: 300, unit: "PT" }
-                  },
-                  transform: {
-                    scaleX: 1,
-                    scaleY: 1,
-                    translateX: 350,
-                    translateY: 100,
-                    unit: "PT"
-                  }
-                }
+              deleteText: {
+                objectId: element.objectId,
+                textRange: { type: 'ALL' }
               }
             });
           }
-        }
-        
-        // Loop through each placeholder in the new slide
-        pageElements.forEach(element => {
-          if (element.shape && element.shape.placeholder) {
-            const placeholderType = element.shape.placeholder.type;
-            const placeholderIndex = element.shape.placeholder.index || 0;
-            const normalizedType = placeholderType.toLowerCase().replace(/[_\s]/g, '');
+        });
+      }
 
-            const possibleKeys = [
-              placeholderType.toLowerCase(),
-              normalizedType,
-              `${normalizedType}${placeholderIndex + 1}`,
-              `${normalizedType}_${placeholderIndex + 1}`,
-              `${normalizedType} ${placeholderIndex + 1}`
-            ];
-
-            const matchingKey = possibleKeys.find(key => slideContent[key] !== undefined);
-            if (matchingKey) {
-              // Insert text
-              contentRequests.push({
-                insertText: {
-                  objectId: element.objectId,
-                  text: slideContent[matchingKey],
-                  insertionIndex: 0,
-                }
-              });
-              // Check for optional formatting
-              const formatKey = `${matchingKey}_format`;
-              if (slideContent[formatKey]) {
-                try {
-                  const formatRequest = JSON.parse(slideContent[formatKey]);
-                  contentRequests.push({
-                    updateTextStyle: {
-                      objectId: element.objectId,
-                      textRange: { type: 'ALL' },
-                      style: formatRequest,
-                      fields: Object.keys(formatRequest).join(',')
-                    }
-                  });
-                } catch (e) {
-                  // Ignore if invalid JSON
+      // 6) Handle images - either from image object or imageUrl string
+      if ((slideContent.image && slideContent.image.url) || slideContent.imageUrl) {
+        const imageUrl = slideContent.image?.url || slideContent.imageUrl;
+        if (imageUrl) {
+          contentRequests.push({
+            createImage: {
+              url: imageUrl,
+              elementProperties: slideContent.image?.elementProperties || {
+                pageObjectId: slideId,
+                size: {
+                  height: { magnitude: 200, unit: "PT" },
+                  width: { magnitude: 300, unit: "PT" }
+                },
+                transform: {
+                  scaleX: 1,
+                  scaleY: 1,
+                  translateX: 350,
+                  translateY: 100,
+                  unit: "PT"
                 }
               }
             }
-          }
-        });
-
-        // 8) Send any contentRequests in one batch update
-        if (contentRequests.length > 0) {
-          await context.fetcher.fetch({
-            method: "POST",
-            url: batchUrl,
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ requests: contentRequests }),
           });
         }
       }
+      
+      // 7) Loop through each placeholder in the slide
+      pageElements.forEach(element => {
+        if (element.shape && element.shape.placeholder) {
+          const placeholderType = element.shape.placeholder.type;
+          const placeholderIndex = element.shape.placeholder.index || 0;
+          const normalizedType = placeholderType.toLowerCase().replace(/[_\s]/g, '');
 
-      // 9) Return the (new) total slide count
-      return newPresData.body.slides.length;
+          const possibleKeys = [
+            placeholderType.toLowerCase(),
+            normalizedType,
+            `${normalizedType}${placeholderIndex + 1}`,
+            `${normalizedType}_${placeholderIndex + 1}`,
+            `${normalizedType} ${placeholderIndex + 1}`
+          ];
+
+          const matchingKey = possibleKeys.find(key => slideContent[key] !== undefined);
+          if (matchingKey) {
+            // Only add text if we're not clearing or if we are clearing (already deleted text above)
+            contentRequests.push({
+              insertText: {
+                objectId: element.objectId,
+                text: slideContent[matchingKey],
+                insertionIndex: 0,
+              }
+            });
+            
+            // Check for optional formatting
+            const formatKey = `${matchingKey}_format`;
+            if (slideContent[formatKey]) {
+              try {
+                const formatRequest = typeof slideContent[formatKey] === 'string' 
+                  ? JSON.parse(slideContent[formatKey])
+                  : slideContent[formatKey];
+                  
+                contentRequests.push({
+                  updateTextStyle: {
+                    objectId: element.objectId,
+                    textRange: { type: 'ALL' },
+                    style: formatRequest,
+                    fields: Object.keys(formatRequest).join(',')
+                  }
+                });
+              } catch (e) {
+                // Ignore if invalid formatting
+              }
+            }
+          }
+        }
+      });
+
+      // 8) Handle speaker notes if provided
+      if (slideContent.notes) {
+        contentRequests.push({
+          insertText: {
+            objectId: slideId,
+            insertionIndex: 0,
+            text: slideContent.notes,
+            insertionRangeType: "SLIDE_NOTES",
+          },
+        });
+      }
+
+      // 9) Send batch update if we have requests
+      if (contentRequests.length > 0) {
+        const batchUrl = `https://slides.googleapis.com/v1/presentations/${presentationId}:batchUpdate`;
+        await context.fetcher.fetch({
+          method: "POST",
+          url: batchUrl,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ requests: contentRequests }),
+        });
+        return true;
+      } else {
+        return false; // No changes made
+      }
     } catch (error) {
       if (error.statusCode === 401) {
-        throw error; // triggers token refresh
+        throw error; // Trigger token refresh
       } else if (error.statusCode === 403) {
         throw new coda.UserVisibleError("You don't have permission to modify this presentation.");
       } else if (error.statusCode === 404) {
-        throw new coda.UserVisibleError("Presentation not found. Check the ID or URL.");
+        throw new coda.UserVisibleError("Presentation or slide not found. Check that the IDs are correct.");
       } else if (error instanceof coda.UserVisibleError) {
-        throw error; // pass it through
+        throw error; // Pass through user visible errors
       } else {
-        throw new coda.UserVisibleError(`Failed to add slide: ${error.body?.error?.message || error.message}`);
+        throw new coda.UserVisibleError(`Failed to update slide content: ${error.body?.error?.message || error.message}`);
       }
     }
   },
 });
-
-// Helper function to get layout autocomplete options
-async function getLayoutAutocompleteOptions(context, search, presentationReference) {
-  // Default predefined layouts
-  const predefinedLayouts = [
-    { display: "Title slide", value: "TITLE" },
-    { display: "Title and body", value: "TITLE_AND_BODY" },
-    { display: "Title and two columns", value: "TITLE_AND_TWO_COLUMNS" },
-    { display: "Title only", value: "TITLE_ONLY" },
-    { display: "Section header", value: "SECTION_HEADER" },
-    { display: "Blank", value: "BLANK" },
-    { display: "Caption", value: "CAPTION" },
-    { display: "Big number", value: "BIG_NUMBER" },
-    { display: "Title and caption", value: "TITLE_AND_CAPTION" },
-    { display: "Caption only", value: "CAPTION_ONLY" },
-    { display: "Main point", value: "MAIN_POINT" },
-    { display: "Section title and description", value: "SECTION_TITLE_AND_DESCRIPTION" },
-    { display: "One column text", value: "ONE_COLUMN_TEXT" },
-    { display: "Quote", value: "QUOTE" }
-  ];
-  
-  // If no presentation is selected, just return predefined layouts
-  if (!presentationReference) {
-    return predefinedLayouts;
-  }
-  
-  try {
-    // Extract presentation ID
-    let presentationId;
-    try {
-      presentationId = extractPresentationId(presentationReference);
-    } catch (error) {
-      // If invalid reference, return predefined layouts
-      return predefinedLayouts;
-    }
-    
-    // Get directly from the presentation API for most accurate results
-    const url = `https://slides.googleapis.com/v1/presentations/${presentationId}`;
-    const response = await context.fetcher.fetch({
-      method: "GET",
-      url: url,
-      cacheTtlSecs: 60 // Cache for 60 seconds to avoid repeated calls
-    });
-    
-    const customLayouts = [];
-    
-    // Process masters and their layouts
-    if (response.body.masters && response.body.masters.length > 0) {
-      for (const master of response.body.masters) {
-        const masterName = master.layoutProperties?.displayName || 
-                           master.properties?.title || 
-                           "Master";
-        
-        if (master.layouts) {
-          for (const layout of master.layouts) {
-            // Get layout properties carefully
-            const layoutId = layout.objectId;
-            // Try multiple sources for a good display name
-            let layoutName = "";
-            
-            if (layout.layoutProperties?.displayName) {
-              layoutName = layout.layoutProperties.displayName;
-            } else if (layout.layoutProperties?.predefinedLayout) {
-              // Format the predefined layout name nicely
-              layoutName = layout.layoutProperties.predefinedLayout
-                .replace(/_/g, ' ')
-                .toLowerCase()
-                .replace(/(^|\s)\S/g, l => l.toUpperCase());
-            } else if (layout.properties?.title) {
-              layoutName = layout.properties.title;
-            } else {
-              layoutName = `Layout ${layoutId.substring(0, 8)}...`;
-            }
-            
-            // Important: For custom layouts, we must use the raw layoutId without prefix
-            customLayouts.push({
-              display: `${layoutName} (from ${masterName})`,
-              value: layoutId // Use direct layoutId, not prefixed with layout_
-            });
-          }
-        }
-      }
-    }
-    
-    // Combine predefined and custom layouts
-    const allLayouts = [...predefinedLayouts, ...customLayouts];
-    
-    // Filter based on search term if provided
-    if (search) {
-      const lowerSearch = search.toLowerCase();
-      return allLayouts.filter(layout => 
-        layout.display.toLowerCase().includes(lowerSearch) ||
-        layout.value.toLowerCase().includes(lowerSearch)
-      );
-    }
-    
-    return allLayouts;
-  } catch (error) {
-    // Log the error for debugging
-    console.error("Error fetching layouts:", error);
-    // On error, return basic layouts
-    return predefinedLayouts;
-  }
-}
 
 // Helper function to create slide with proper layout reference
 function createSlideWithLayout(layoutType, presentationId) {
@@ -1470,6 +1477,963 @@ pack.addFormula({
         throw new coda.UserVisibleError("Presentation not found. Check the ID or URL.");
       } else {
         throw new coda.UserVisibleError(`Failed to get slides: ${error.body?.error?.message || error.message}`);
+      }
+    }
+  },
+});
+
+// Formula to get IDs for all slides in a presentation
+pack.addFormula({
+  name: "GetAllSlideIds",
+  description: "Returns IDs for all slides in a presentation",
+  parameters: [
+    coda.makeParameter({
+      type: coda.ParameterType.String,
+      name: "presentationReference",
+      description: "The ID or URL of the presentation",
+    })
+  ],
+  resultType: coda.ValueType.Array,
+  items: coda.makeObjectSchema({
+    properties: {
+      slideId: { type: coda.ValueType.String },
+      slideNumber: { type: coda.ValueType.Number },
+      title: { type: coda.ValueType.String },
+      layoutType: { type: coda.ValueType.String },
+      presentationId: { type: coda.ValueType.String },
+      slideUrl: { type: coda.ValueType.String, codaType: coda.ValueHintType.Url }
+    },
+    displayProperty: "slideNumber",
+  }),
+  execute: async function ([presentationReference], context) {
+    try {
+      const presentationId = extractPresentationId(presentationReference);
+      
+      // Fetch presentation
+      const presUrl = `https://slides.googleapis.com/v1/presentations/${presentationId}`;
+      const presData = await context.fetcher.fetch({ 
+        method: "GET", 
+        url: presUrl,
+        cacheTtlSecs: 0 // Disable caching to get fresh data
+      });
+      
+      const slides = presData.body.slides || [];
+      const result = [];
+      
+      // Build master/layout map to determine layout types
+      const layoutTypeMap = {};
+      if (presData.body.masters) {
+        for (const master of presData.body.masters) {
+          if (master.layouts) {
+            for (const layout of master.layouts) {
+              if (layout.objectId && layout.layoutProperties && layout.layoutProperties.predefinedLayout) {
+                layoutTypeMap[layout.objectId] = layout.layoutProperties.predefinedLayout;
+              }
+            }
+          }
+        }
+      }
+      
+      // Process each slide
+      slides.forEach((slide, index) => {
+        // Extract title if available
+        let title = "";
+        if (slide.pageElements) {
+          for (const element of slide.pageElements) {
+            if (element.shape && element.shape.placeholder && 
+                element.shape.placeholder.type === "TITLE" && 
+                element.shape.text && element.shape.text.textElements) {
+              
+              title = element.shape.text.textElements
+                .filter(t => t.textRun)
+                .map(t => t.textRun.content)
+                .join("")
+                .trim();
+              
+              if (title) break;
+            }
+          }
+        }
+        
+        // Determine layout type
+        let layoutType = "UNKNOWN";
+        if (slide.slideProperties && slide.slideProperties.layoutObjectId) {
+          layoutType = layoutTypeMap[slide.slideProperties.layoutObjectId] || "CUSTOM";
+        }
+        
+        result.push({
+          slideId: slide.objectId,
+          slideNumber: index + 1,
+          title: title,
+          layoutType: layoutType,
+          presentationId: presentationId,
+          slideUrl: `https://docs.google.com/presentation/d/${presentationId}/edit#slide=id.${slide.objectId}`
+        });
+      });
+      
+      return result;
+    } catch (error) {
+      if (error.statusCode === 401) {
+        throw error; // Trigger token refresh
+      } else if (error.statusCode === 403) {
+        throw new coda.UserVisibleError("You don't have permission to access this presentation.");
+      } else if (error.statusCode === 404) {
+        throw new coda.UserVisibleError("Presentation not found. Check the ID or URL.");
+      } else if (error instanceof coda.UserVisibleError) {
+        throw error; // Pass through user visible errors
+      } else {
+        throw new coda.UserVisibleError(`Failed to get slide IDs: ${error.body?.error?.message || error.message}`);
+      }
+    }
+  },
+});
+
+// Helper function to get layout autocomplete options
+async function getLayoutAutocompleteOptions(context, search, presentationReference) {
+  // Default predefined layouts
+  const predefinedLayouts = [
+    { display: "Title slide", value: "TITLE" },
+    { display: "Title and body", value: "TITLE_AND_BODY" },
+    { display: "Title and two columns", value: "TITLE_AND_TWO_COLUMNS" },
+    { display: "Title only", value: "TITLE_ONLY" },
+    { display: "Section header", value: "SECTION_HEADER" },
+    { display: "Blank", value: "BLANK" },
+    { display: "Caption", value: "CAPTION" },
+    { display: "Big number", value: "BIG_NUMBER" },
+    { display: "Title and caption", value: "TITLE_AND_CAPTION" },
+    { display: "Caption only", value: "CAPTION_ONLY" },
+    { display: "Main point", value: "MAIN_POINT" },
+    { display: "Section title and description", value: "SECTION_TITLE_AND_DESCRIPTION" },
+    { display: "One column text", value: "ONE_COLUMN_TEXT" },
+    { display: "Quote", value: "QUOTE" }
+  ];
+  
+  // If no presentation is selected, just return predefined layouts
+  if (!presentationReference) {
+    return predefinedLayouts;
+  }
+  
+  try {
+    // Extract presentation ID
+    let presentationId;
+    try {
+      presentationId = extractPresentationId(presentationReference);
+    } catch (error) {
+      // If invalid reference, return predefined layouts
+      return predefinedLayouts;
+    }
+    
+    // Get directly from the presentation API for most accurate results
+    const url = `https://slides.googleapis.com/v1/presentations/${presentationId}`;
+    const response = await context.fetcher.fetch({
+      method: "GET",
+      url: url,
+      cacheTtlSecs: 60 // Cache for 60 seconds to avoid repeated calls
+    });
+    
+    const customLayouts = [];
+    
+    // Process masters and their layouts
+    if (response.body.masters && response.body.masters.length > 0) {
+      for (const master of response.body.masters) {
+        const masterName = master.layoutProperties?.displayName || 
+                           master.properties?.title || 
+                           "Master";
+        
+        if (master.layouts) {
+          for (const layout of master.layouts) {
+            // Get layout properties carefully
+            const layoutId = layout.objectId;
+            // Try multiple sources for a good display name
+            let layoutName = "";
+            
+            if (layout.layoutProperties?.displayName) {
+              layoutName = layout.layoutProperties.displayName;
+            } else if (layout.layoutProperties?.predefinedLayout) {
+              // Format the predefined layout name nicely
+              layoutName = layout.layoutProperties.predefinedLayout
+                .replace(/_/g, ' ')
+                .toLowerCase()
+                .replace(/(^|\s)\S/g, l => l.toUpperCase());
+            } else if (layout.properties?.title) {
+              layoutName = layout.properties.title;
+            } else {
+              layoutName = `Layout ${layoutId.substring(0, 8)}...`;
+            }
+            
+            // Important: For custom layouts, we must use the raw layoutId without prefix
+            customLayouts.push({
+              display: `${layoutName} (from ${masterName})`,
+              value: layoutId // Use direct layoutId, not prefixed with layout_
+            });
+          }
+        }
+      }
+    }
+    
+    // Combine predefined and custom layouts
+    const allLayouts = [...predefinedLayouts, ...customLayouts];
+    
+    // Filter based on search term if provided
+    if (search) {
+      const lowerSearch = search.toLowerCase();
+      return allLayouts.filter(layout => 
+        layout.display.toLowerCase().includes(lowerSearch) ||
+        layout.value.toLowerCase().includes(lowerSearch)
+      );
+    }
+    
+    return allLayouts;
+  } catch (error) {
+    // Log the error for debugging
+    console.error("Error fetching layouts:", error);
+    // On error, return basic layouts
+    return predefinedLayouts;
+  }
+}
+
+// Formula to get comprehensive content information for a specific slide
+pack.addFormula({
+  name: "GetSlideContent",
+  description: "Retrieves comprehensive information about a specific slide including content, layout, and element details",
+  parameters: [
+    coda.makeParameter({
+      type: coda.ParameterType.String,
+      name: "presentationReference",
+      description: "The ID or URL of the presentation",
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.String,
+      name: "slideId",
+      description: "ID of the specific slide to retrieve",
+      optional: true,
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.Number,
+      name: "slideNumber",
+      description: "Number of the slide to retrieve (1-based index)",
+      optional: true,
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.Boolean,
+      name: "includeElementDetails",
+      description: "Whether to include detailed information about each element",
+      optional: true,
+      suggestedValue: false
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.Boolean,
+      name: "includeThumbnail",
+      description: "Whether to include slide thumbnail URL",
+      optional: true,
+      suggestedValue: false
+    }),
+    coda.makeParameter({
+      type: coda.ParameterType.Boolean,
+      name: "includeNotes",
+      description: "Whether to include slide notes",
+      optional: true,
+      suggestedValue: false
+    }),
+  ],
+  resultType: coda.ValueType.Object,
+  schema: coda.makeObjectSchema({
+    properties: {
+      slideId: { type: coda.ValueType.String },
+      slideNumber: { type: coda.ValueType.Number },
+      presentationId: { type: coda.ValueType.String },
+      thumbnailUrl: { type: coda.ValueType.String, codaType: coda.ValueHintType.ImageReference },
+      slideUrl: { type: coda.ValueType.String, codaType: coda.ValueHintType.Url },
+      
+      // Layout information
+      layoutId: { type: coda.ValueType.String },
+      layoutType: { type: coda.ValueType.String },
+      masterId: { type: coda.ValueType.String },
+      masterName: { type: coda.ValueType.String },
+      
+      // Content
+      title: { type: coda.ValueType.String },
+      subtitle: { type: coda.ValueType.String },
+      bodyTexts: { 
+        type: coda.ValueType.Array,
+        items: { type: coda.ValueType.String }
+      },
+      notes: { type: coda.ValueType.String },
+      
+      // Background properties
+      background: coda.makeObjectSchema({
+        properties: {
+          type: { type: coda.ValueType.String },
+          color: { type: coda.ValueType.String },
+          opacity: { type: coda.ValueType.Number },
+          imageUrl: { type: coda.ValueType.String, codaType: coda.ValueHintType.ImageReference },
+          propertyState: { type: coda.ValueType.String },
+        },
+      }),
+      
+      // Transition information
+      transition: coda.makeObjectSchema({
+        properties: {
+          type: { type: coda.ValueType.String },
+          speed: { type: coda.ValueType.String },
+          durationSeconds: { type: coda.ValueType.Number },
+          autoAdvanceSeconds: { type: coda.ValueType.Number },
+        },
+      }),
+      
+      // Dimensions and position
+      size: coda.makeObjectSchema({
+        properties: {
+          width: { type: coda.ValueType.Number },
+          height: { type: coda.ValueType.Number },
+          unit: { type: coda.ValueType.String },
+        },
+      }),
+      
+      // Element counts
+      elementCounts: coda.makeObjectSchema({
+        properties: {
+          images: { type: coda.ValueType.Number },
+          shapes: { type: coda.ValueType.Number },
+          tables: { type: coda.ValueType.Number },
+          videos: { type: coda.ValueType.Number },
+          lines: { type: coda.ValueType.Number },
+          charts: { type: coda.ValueType.Number },
+          textBoxes: { type: coda.ValueType.Number },
+          placeholders: { type: coda.ValueType.Number },
+          wordCount: { type: coda.ValueType.Number },
+          total: { type: coda.ValueType.Number },
+        },
+      }),
+      
+      // Extracted content
+      textContent: coda.makeObjectSchema({
+        properties: {},
+        propertyNames: coda.makeSchema({
+          type: coda.ValueType.String,
+        }),
+        type: coda.ValueType.Object,
+      }),
+      placeholders: { 
+        type: coda.ValueType.Array,
+        items: coda.makeObjectSchema({
+          properties: {
+            id: { type: coda.ValueType.String },
+            type: { type: coda.ValueType.String },
+            index: { type: coda.ValueType.Number },
+            content: { type: coda.ValueType.String },
+            wordCount: { type: coda.ValueType.Number },
+            hasFormatting: { type: coda.ValueType.Boolean },
+          }
+        }) 
+      },
+      
+      // Links
+      links: { 
+        type: coda.ValueType.Array,
+        items: coda.makeObjectSchema({
+          properties: {
+            text: { type: coda.ValueType.String },
+            url: { type: coda.ValueType.String, codaType: coda.ValueHintType.Url },
+            elementId: { type: coda.ValueType.String },
+          },
+        })
+      },
+      
+      // Image information
+      images: {
+        type: coda.ValueType.Array,
+        items: coda.makeObjectSchema({
+          properties: {
+            id: { type: coda.ValueType.String },
+            sourceUrl: { type: coda.ValueType.String, codaType: coda.ValueHintType.Url },
+            contentUrl: { type: coda.ValueType.String, codaType: coda.ValueHintType.ImageReference },
+            size: coda.makeObjectSchema({
+              properties: {
+                width: coda.makeObjectSchema({
+                  properties: {
+                    magnitude: { type: coda.ValueType.Number },
+                    unit: { type: coda.ValueType.String }
+                  }
+                }),
+                height: coda.makeObjectSchema({
+                  properties: {
+                    magnitude: { type: coda.ValueType.Number },
+                    unit: { type: coda.ValueType.String }
+                  }
+                })
+              }
+            }),
+            position: coda.makeObjectSchema({
+              properties: {
+                scaleX: { type: coda.ValueType.Number },
+                scaleY: { type: coda.ValueType.Number },
+                translateX: { type: coda.ValueType.Number },
+                translateY: { type: coda.ValueType.Number },
+                unit: { type: coda.ValueType.String }
+              }
+            }),
+            description: { type: coda.ValueType.String },
+          }
+        })
+      },
+      
+      // Tables information 
+      tables: {
+        type: coda.ValueType.Array,
+        items: coda.makeObjectSchema({
+          properties: {
+            id: { type: coda.ValueType.String },
+            rows: { type: coda.ValueType.Number },
+            columns: { type: coda.ValueType.Number },
+            hasContent: { type: coda.ValueType.Boolean },
+            wordCount: { type: coda.ValueType.Number },
+          }
+        })
+      },
+      
+      // Metadata
+      created: { type: coda.ValueType.String },
+      modified: { type: coda.ValueType.String },
+      
+      // Detailed elements (if requested)
+      elements: { type: coda.ValueType.String },
+      
+      // Full raw data
+      contentJson: { type: coda.ValueType.String },
+      slideProperties: { type: coda.ValueType.String },
+    },
+    displayProperty: "slideId",
+  }),
+  execute: async function ([
+    presentationReference, 
+    slideId, 
+    slideNumber, 
+    includeElementDetails = false,
+    includeThumbnail = true,
+    includeNotes = true
+  ], context) {
+    // Helper function to count words in text
+    function countWords(text) {
+      if (!text) return 0;
+      return text.trim().split(/\s+/).filter(word => word.length > 0).length;
+    }
+    
+    // Helper function to count words in table cells
+    function countWordsInTable(table) {
+      if (!table || !table.tableRows) return 0;
+      
+      let totalWords = 0;
+      
+      for (const row of table.tableRows) {
+        if (row.tableCells) {
+          for (const cell of row.tableCells) {
+            if (cell.text && cell.text.textElements) {
+              const cellText = cell.text.textElements
+                .filter(t => t.textRun)
+                .map(t => t.textRun.content)
+                .join(" ");
+              
+              totalWords += countWords(cellText);
+            }
+          }
+        }
+      }
+      
+      return totalWords;
+    }
+    try {
+      // 1. Extract presentation ID
+      const presentationId = extractPresentationId(presentationReference);
+      
+      // 2. Validate parameters
+      if (!slideId && !slideNumber) {
+        throw new coda.UserVisibleError("Either slideId or slideNumber is required.");
+      }
+      
+      // 3. Get presentation data
+      const presUrl = `https://slides.googleapis.com/v1/presentations/${presentationId}`;
+      const presData = await context.fetcher.fetch({ 
+        method: "GET", 
+        url: presUrl 
+      });
+      
+      const slides = presData.body.slides || [];
+      
+      if (slides.length === 0) {
+        throw new coda.UserVisibleError("No slides found in presentation.");
+      }
+      
+      // 4. Find the target slide
+      let targetSlide;
+      let targetSlideIndex = -1;
+      
+      if (slideId) {
+        // Find by ID
+        targetSlideIndex = slides.findIndex(s => s.objectId === slideId);
+        if (targetSlideIndex === -1) {
+          throw new coda.UserVisibleError(`Slide with ID ${slideId} not found.`);
+        }
+        targetSlide = slides[targetSlideIndex];
+      } else if (slideNumber) {
+        // Find by number (1-based index)
+        if (slideNumber < 1 || slideNumber > slides.length) {
+          throw new coda.UserVisibleError(`Slide number must be between 1 and ${slides.length}.`);
+        }
+        targetSlideIndex = slideNumber - 1;
+        targetSlide = slides[targetSlideIndex];
+      }
+      
+      // 5. Build master/layout mapping
+      const masterLayoutMap = {};
+      const layoutTypeMap = {};
+      const masterNameMap = {};
+      
+      if (presData.body.masters) {
+        for (const master of presData.body.masters) {
+          const masterId = master.objectId;
+          masterNameMap[masterId] = master.properties?.title || "Unnamed Master";
+          
+          if (master.layouts) {
+            for (const layout of master.layouts) {
+              const layoutId = layout.objectId;
+              masterLayoutMap[layoutId] = masterId;
+              
+              if (layout.layoutProperties && layout.layoutProperties.predefinedLayout) {
+                layoutTypeMap[layoutId] = layout.layoutProperties.predefinedLayout;
+              }
+            }
+          }
+        }
+      }
+      
+      // 6. Extract layout information
+      let layoutId = "UNKNOWN";
+      let layoutType = "UNKNOWN";
+      let masterId = "UNKNOWN";
+      let masterName = "Unknown";
+      
+      if (targetSlide.slideProperties && targetSlide.slideProperties.layoutObjectId) {
+        layoutId = targetSlide.slideProperties.layoutObjectId;
+        layoutType = layoutTypeMap[layoutId] || "CUSTOM";
+        masterId = masterLayoutMap[layoutId] || "UNKNOWN";
+        masterName = masterNameMap[masterId] || "Unknown";
+      }
+      
+      // 7. Process elements and extract content
+      const pageElements = targetSlide.pageElements || [];
+      const placeholders = [];
+      const bodyTexts = [];
+      const textContent = {};
+      const links = [];
+      
+      // Count element types
+      let elementCounts = {
+        images: 0,
+        shapes: 0,
+        tables: 0,
+        videos: 0,
+        lines: 0,
+        charts: 0,
+        textBoxes: 0,
+        placeholders: 0,
+        total: pageElements.length,
+        wordCount: 0
+      };
+      
+      let title = "";
+      let subtitle = "";
+      
+      // Process each element
+      for (const element of pageElements) {
+        // Count by type
+        if (element.image) elementCounts.images++;
+        else if (element.shape && !element.shape.placeholder) elementCounts.shapes++;
+        else if (element.table) elementCounts.tables++;
+        else if (element.video) elementCounts.videos++;
+        else if (element.line) elementCounts.lines++;
+        else if (element.shape && element.shape.text && !element.shape.placeholder) elementCounts.textBoxes++;
+        
+        if (element.shape && element.shape.placeholder) {
+          elementCounts.placeholders++;
+          
+          const placeholderType = element.shape.placeholder.type;
+          const placeholderIndex = element.shape.placeholder.index || 0;
+          
+          // Extract text content if available
+          let content = "";
+          if (element.shape.text && element.shape.text.textElements) {
+            content = element.shape.text.textElements
+              .filter(t => t.textRun)
+              .map(t => t.textRun.content)
+              .join("")
+              .trim();
+              
+            // Store in appropriate variable
+            if (placeholderType === "TITLE") {
+              title = content;
+            } else if (placeholderType === "SUBTITLE") {
+              subtitle = content;
+            } else if (placeholderType === "BODY") {
+              bodyTexts[placeholderIndex] = content;
+            }
+            
+            // Store in general content map
+            textContent[placeholderType] = content;
+            textContent[`${placeholderType}_${placeholderIndex}`] = content;
+            
+            // Extract links if any
+            if (element.shape.text.textElements) {
+              for (const textElement of element.shape.text.textElements) {
+                if (textElement.textRun && 
+                    textElement.textRun.textStyle && 
+                    textElement.textRun.textStyle.link) {
+                  links.push({
+                    text: textElement.textRun.content.trim(),
+                    url: textElement.textRun.textStyle.link.url
+                  });
+                }
+              }
+            }
+          }
+          
+          // Add to placeholders array
+          placeholders.push({
+            id: element.objectId,
+            type: placeholderType,
+            index: placeholderIndex,
+            content: content
+          });
+        }
+        
+        // Look for chart elements (they're usually shapes with specific objectId patterns)
+        if (element.objectId && element.objectId.includes('chart')) {
+          elementCounts.charts++;
+        }
+      }
+      
+      // 8. Get notes if requested
+      let notes = "";
+      if (includeNotes && targetSlide.slideProperties && targetSlide.slideProperties.notesPage) {
+        const notesPageId = targetSlide.slideProperties.notesPage.pageObjectId;
+        notes = await getSpeakerNotes(context, presentationId, notesPageId);
+      }
+      
+      // 9. Extract additional slide properties
+      
+      // Process background information
+      let background: {
+        type: string;
+        color: string;
+        opacity: number;
+        propertyState: string;
+        imageUrl?: string;
+      } = {
+        type: "NONE",
+        color: "",
+        opacity: 1,
+        propertyState: "INHERITED"
+      };
+      
+      if (targetSlide.slideProperties && targetSlide.slideProperties.pageBackgroundFill) {
+        const bgFill = targetSlide.slideProperties.pageBackgroundFill;
+        background.propertyState = bgFill.propertyState || "INHERITED";
+        
+        if (bgFill.solidFill) {
+          background.type = "SOLID";
+          
+          if (bgFill.solidFill.color) {
+            if (bgFill.solidFill.color.rgbColor) {
+              const rgb = bgFill.solidFill.color.rgbColor;
+              const r = Math.round((rgb.red || 0) * 255);
+              const g = Math.round((rgb.green || 0) * 255);
+              const b = Math.round((rgb.blue || 0) * 255);
+              background.color = `rgb(${r}, ${g}, ${b})`;
+            } else if (bgFill.solidFill.color.themeColor) {
+              background.color = bgFill.solidFill.color.themeColor;
+            }
+          }
+          
+          if (bgFill.solidFill.alpha !== undefined) {
+            background.opacity = bgFill.solidFill.alpha;
+          }
+        } else if (bgFill.stretchedPictureFill) {
+          background.type = "IMAGE";
+          if (bgFill.stretchedPictureFill.contentUrl) {
+            background.imageUrl = bgFill.stretchedPictureFill.contentUrl;
+          }
+        } else if (bgFill.gradientFill) {
+          background.type = "GRADIENT";
+        }
+      }
+      
+      // Process transition information
+      const transition = {
+        type: "NONE",
+        speed: "MEDIUM",
+        durationSeconds: 0,
+        autoAdvanceSeconds: 0
+      };
+      
+      if (targetSlide.slideProperties && targetSlide.slideProperties.transition) {
+        const slideTransition = targetSlide.slideProperties.transition;
+        // Find the transition type (first property that's not transitionDuration)
+        for (const key in slideTransition) {
+          if (key !== 'transitionDuration') {
+            transition.type = key;
+            break;
+          }
+        }
+        
+        // Extract duration and speed if available
+        if (slideTransition.transitionDuration) {
+          if (slideTransition.transitionDuration.seconds) {
+            transition.durationSeconds = Number(slideTransition.transitionDuration.seconds);
+          }
+          if (slideTransition.transitionDuration.nanos) {
+            transition.durationSeconds += slideTransition.transitionDuration.nanos / 1e9;
+          }
+        }
+        
+        // Check for any specific transition properties
+        if (transition.type !== "NONE" && slideTransition[transition.type]) {
+          const transitionProps = slideTransition[transition.type];
+          if (transitionProps.speed) {
+            transition.speed = transitionProps.speed;
+          }
+        }
+      }
+      
+      // Auto-advance timing if available
+      if (targetSlide.slideProperties && targetSlide.slideProperties.autoAdvanceTime) {
+        const advanceTime = targetSlide.slideProperties.autoAdvanceTime;
+        if (advanceTime.seconds || advanceTime.nanos) {
+          transition.autoAdvanceSeconds = (advanceTime.seconds || 0) + ((advanceTime.nanos || 0) / 1e9);
+        }
+      }
+      
+      // Extract slide size
+      const size = {
+        width: 0,
+        height: 0, 
+        unit: "PT"
+      };
+      
+      if (presData.body.pageSize) {
+        size.width = presData.body.pageSize.width?.magnitude || 0;
+        size.height = presData.body.pageSize.height?.magnitude || 0;
+        size.unit = presData.body.pageSize.width?.unit || "PT";
+      }
+      
+      // Process images
+      const images = [];
+      const tables = [];
+      let wordCount = 0;
+      
+      for (const element of pageElements) {
+        // Process images
+        if (element.image) {
+          const image = {
+            id: element.objectId,
+            sourceUrl: element.image.sourceUrl || "",
+            contentUrl: element.image.contentUrl || "",
+            size: element.size || {},
+            position: element.transform || {},
+            description: element.description || ""
+          };
+          images.push(image);
+        }
+        
+        // Process tables
+        if (element.table) {
+          const tableWordCount = countWordsInTable(element.table);
+          const table = {
+            id: element.objectId,
+            rows: element.table.rows || 0,
+            columns: element.table.columns || 0,
+            hasContent: tableWordCount > 0,
+            wordCount: tableWordCount
+          };
+          tables.push(table);
+          wordCount += tableWordCount;
+        }
+        
+        // Count words in text elements
+        if (element.shape && element.shape.text && element.shape.text.textElements) {
+          const text = element.shape.text.textElements
+            .filter(t => t.textRun)
+            .map(t => t.textRun.content)
+            .join(" ");
+          
+          const elementWordCount = countWords(text);
+          wordCount += elementWordCount;
+          
+          // Update placeholder word counts if applicable
+          if (element.shape.placeholder) {
+            const placeholderIndex = placeholders.findIndex(p => 
+              p.id === element.objectId
+            );
+            
+            if (placeholderIndex >= 0) {
+              // Create updated placeholder with all properties
+              const updatedPlaceholder = {
+                id: placeholders[placeholderIndex].id,
+                type: placeholders[placeholderIndex].type,
+                index: placeholders[placeholderIndex].index,
+                content: placeholders[placeholderIndex].content,
+                wordCount: elementWordCount,
+                hasFormatting: element.shape.text.textElements.some(t => 
+                  t.textRun && t.textRun.textStyle && 
+                  (t.textRun.textStyle.bold || t.textRun.textStyle.italic || 
+                   t.textRun.textStyle.underline || t.textRun.textStyle.foregroundColor)
+                )
+              };
+              placeholders[placeholderIndex] = updatedPlaceholder;
+            }
+          }
+        }
+      }
+      
+      // Create a new elementCounts object with all properties
+      elementCounts.wordCount = wordCount;
+      
+      // Add creation and modification info if available
+      let created = "";
+      let modified = "";
+      
+      if (presData.body.presentationProperties && presData.body.presentationProperties.createdTime) {
+        created = presData.body.presentationProperties.createdTime;
+      }
+      
+      if (presData.body.presentationProperties && presData.body.presentationProperties.modifiedTime) {
+        modified = presData.body.presentationProperties.modifiedTime;
+      }
+      
+      // 10. Build result object
+      const result: {
+        slideId: string;
+        slideNumber: number;
+        presentationId: string;
+        slideUrl: string;
+        layoutId: string;
+        layoutType: string;
+        masterId: string;
+        masterName: string;
+        title: string;
+        subtitle: string;
+        bodyTexts: string[];
+        notes: string;
+        background: any;
+        transition: any;
+        size: any;
+        elementCounts: any;
+        textContent: any;
+        placeholders: any[];
+        links?: any[];
+        images?: any[];
+        tables?: any[];
+        created: string;
+        modified: string;
+        contentJson: string;
+        slideProperties: string;
+        thumbnailUrl?: string;
+        elements?: string;
+      } = {
+        slideId: targetSlide.objectId,
+        slideNumber: targetSlideIndex + 1,
+        presentationId: presentationId,
+        slideUrl: `https://docs.google.com/presentation/d/${presentationId}/edit#slide=id.${targetSlide.objectId}`,
+        
+        // Layout information
+        layoutId: layoutId,
+        layoutType: layoutType,
+        masterId: masterId,
+        masterName: masterName,
+        
+        // Content
+        title: title,
+        subtitle: subtitle,
+        bodyTexts: bodyTexts.filter(text => text),
+        notes: notes,
+        
+        // Background
+        background: background,
+        
+        // Transition
+        transition: transition,
+        
+        // Size
+        size: size,
+        
+        // Element counts  
+        elementCounts: elementCounts,
+        
+        // Extracted content
+        textContent: textContent,
+        placeholders: placeholders,
+        
+        // Links
+        links: links.length > 0 ? links : undefined,
+        
+        // Images
+        images: images.length > 0 ? images : undefined,
+        
+        // Tables
+        tables: tables.length > 0 ? tables : undefined,
+        
+        // Metadata
+        created: created,
+        modified: modified,
+        
+        // Raw data
+        contentJson: JSON.stringify(textContent, null, 2),
+        slideProperties: JSON.stringify(targetSlide.slideProperties, null, 2),
+      };
+      
+      // 10. Add thumbnail if requested
+      if (includeThumbnail) {
+        result.thumbnailUrl = `https://slides.googleapis.com/v1/presentations/${presentationId}/pages/${targetSlide.objectId}/thumbnail?thumbnailProperties.thumbnailSize=MEDIUM`;
+      }
+      
+      // 11. Add element details if requested
+      if (includeElementDetails) {
+        // Simplify elements to avoid excessive data
+        const simplifiedElements = pageElements.map(element => ({
+          id: element.objectId,
+          type: element.shape ? 'shape' : 
+               element.image ? 'image' : 
+               element.table ? 'table' : 
+               element.video ? 'video' : 
+               element.line ? 'line' : 'other',
+          position: element.transform,
+          size: element.size,
+          placeholder: element.shape?.placeholder ? {
+            type: element.shape.placeholder.type,
+            index: element.shape.placeholder.index
+          } : undefined,
+          textContent: element.shape?.text ? {
+            hasText: !!element.shape.text.textElements?.length,
+            textLength: element.shape.text.textElements?.reduce(
+              (total, el) => total + (el.textRun?.content?.length || 0), 0
+            ) || 0
+          } : undefined
+        }));
+        
+        result.elements = JSON.stringify(simplifiedElements, null, 2);
+      }
+      
+      return result;
+    } catch (error) {
+      if (error.statusCode === 401) {
+        throw error; // Trigger token refresh
+      } else if (error.statusCode === 403) {
+        throw new coda.UserVisibleError("You don't have permission to access this presentation.");
+      } else if (error.statusCode === 404) {
+        throw new coda.UserVisibleError("Presentation or slide not found. Check that the IDs are correct.");
+      } else if (error instanceof coda.UserVisibleError) {
+        throw error; // Pass through user visible errors
+      } else {
+        throw new coda.UserVisibleError(`Failed to get slide content: ${error.body?.error?.message || error.message}`);
       }
     }
   },
